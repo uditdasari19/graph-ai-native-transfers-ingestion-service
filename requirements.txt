@@ -1,0 +1,9 @@
+# Core dependencies for ingestion service that ingests native transfers
+# Add specific dependencies as needed for ingestion functionality
+
+# Basic Python dependencies
+requests>=2.31.0
+boto3>=1.34.0
+
+# Add more dependencies as the service evolves
+# web3>=6.0.0     # Uncomment if blockchain interaction is needed

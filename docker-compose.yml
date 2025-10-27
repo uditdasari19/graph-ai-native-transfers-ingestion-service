@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  ingestion-service:
+    build: .
+    container_name: ingestion-service
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Uncomment and modify if you want to use environment variables for credentials
+    # env_file:
+    #   - .env
+    # volumes:
+    #   - ./data:/app/data  # Uncomment if you want persistent data storage
