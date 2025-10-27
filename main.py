@@ -262,7 +262,6 @@ def filter_and_transform_native_transfers(
     native_transfer_transactions = []
 
     for transaction in transactions:
-        print(f"Processing transaction {transaction.get('hash')}")
         formatted, wallet_addresses = extract_native_transfers(
             transaction, api_request_time
         )
@@ -296,8 +295,6 @@ def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
             MessageAttributes=message_attributes,
         )
 
-        print(f"✓ Published transaction {transaction.get('hash')} to SNS")
-
     except Exception as e:
         print(f"❌ Error publishing to SNS: {e}")
         raise
@@ -318,6 +315,7 @@ def main():
     try:
         iteration = 0
         while True:
+            loop_start_time = time.time()
             iteration += 1
             current_time = time.strftime("%Y-%m-%d %H:%M:%S")
             timestamp_safe = current_time.replace(" ", "_").replace(":", "-")
@@ -361,7 +359,10 @@ def main():
                 else:
                     print("ℹ️ No transactions found")
 
-            print(f"\n💤 Sleeping for 1 minute...")
+            loop_end_time = time.time()
+            loop_duration = loop_end_time - loop_start_time
+            print(f"\n⏱️ Loop processing time: {loop_duration:.2f} seconds")
+            print(f"💤 Sleeping for 1 minute...")
             time.sleep(60)  # Wait 1 minute before next iteration
 
     except KeyboardInterrupt:
