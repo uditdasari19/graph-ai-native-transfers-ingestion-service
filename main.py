@@ -14,6 +14,8 @@ from supabase import create_client, Client
 import requests
 from datetime import datetime
 import boto3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 # Supabase configuration
@@ -42,6 +44,7 @@ sns_client = boto3.client("sns", region_name="us-east-1")
 
 # Cache for wallet addresses (set of known wallet addresses)
 _wallet_cache: Set[str] = set()
+_cache_lock = threading.Lock()  # Thread-safe access to cache
 
 
 def get_all_wallets(supabase: Client) -> List[str]:
@@ -51,8 +54,9 @@ def get_all_wallets(supabase: Client) -> List[str]:
         wallets = [row["wallet_id"] for row in response.data]
 
         # Add all wallets to cache (addresses are already normalized with 0x)
-        for wallet in wallets:
-            _wallet_cache.add(wallet.lower())
+        with _cache_lock:
+            for wallet in wallets:
+                _wallet_cache.add(wallet.lower())
 
         return wallets
     except Exception as e:
@@ -128,6 +132,7 @@ def get_all_wallet_transactions(
 def is_contract_address(address: str) -> Tuple[bool, str]:
     """
     Check if an address is a contract address using cache first, then Alchemy API.
+    Thread-safe version.
 
     Args:
         address: The address to check (already has 0x prefix)
@@ -140,8 +145,11 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
     # Addresses are already normalized (0x prefix), just make lowercase
     normalized_addr = address.lower()
 
-    # Check cache first
-    if normalized_addr in _wallet_cache:
+    # Check cache first (thread-safe read)
+    with _cache_lock:
+        in_cache = normalized_addr in _wallet_cache
+
+    if in_cache:
         # It's a wallet
         wallet_address = address
         return False, wallet_address
@@ -171,9 +179,10 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
         # If result has bytecode, it's a contract
         is_contract = result != "0x" and result != ""
 
-        # If it's a wallet, add to cache
+        # If it's a wallet, add to cache (thread-safe write)
         if not is_contract:
-            _wallet_cache.add(normalized_addr)
+            with _cache_lock:
+                _wallet_cache.add(normalized_addr)
 
         wallet_address = address if not is_contract else ""
         return is_contract, wallet_address
@@ -187,14 +196,45 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
         return True, ""
 
 
+def batch_check_contracts(addresses: List[str]) -> Dict[str, Tuple[bool, str]]:
+    """
+    Check multiple addresses concurrently to see if they are contracts.
+
+    Args:
+        addresses: List of addresses to check
+
+    Returns:
+        Dictionary mapping address to (is_contract: bool, wallet_address: str)
+    """
+    results = {}
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_addr = {
+            executor.submit(is_contract_address, addr): addr for addr in addresses
+        }
+
+        for future in as_completed(future_to_addr):
+            addr = future_to_addr[future]
+            try:
+                results[addr] = future.result()
+            except Exception as e:
+                print(f"⚠️ Error checking address {addr}: {e}")
+                results[addr] = (True, "")  # Default to contract on error
+
+    return results
+
+
 def extract_native_transfers(
-    transaction: Dict, api_request_time: str
+    transaction: Dict,
+    api_request_time: str,
+    contract_results: Dict[str, Tuple[bool, str]],
 ) -> tuple[Optional[Dict], Set[str]]:
     """Extract native transfers from a transaction and format them
 
     Args:
         transaction: Raw transaction dictionary from API
         api_request_time: ISO format timestamp when API request was made
+        contract_results: Pre-computed results from batch contract checking
 
     Returns:
         tuple: (formatted_transaction, wallet_addresses_set)
@@ -212,13 +252,14 @@ def extract_native_transfers(
             from_address = transfer.get("from_address")
             to_address = transfer.get("to_address")
 
-            # Check if from_address is a contract
-            from_is_contract, from_wallet = is_contract_address(from_address)
+            # Look up contract results from batch check
+            from_is_contract, from_wallet = contract_results.get(
+                from_address, (True, "")
+            )
             if not from_is_contract and from_wallet:
                 wallet_addresses.add(from_wallet)
 
-            # Check if to_address is a contract
-            to_is_contract, to_wallet = is_contract_address(to_address)
+            to_is_contract, to_wallet = contract_results.get(to_address, (True, ""))
             if not to_is_contract and to_wallet:
                 wallet_addresses.add(to_wallet)
 
@@ -250,7 +291,8 @@ def extract_native_transfers(
 def filter_and_transform_native_transfers(
     transactions: List[Dict], api_request_time: str
 ) -> List[tuple[Dict, Set[str]]]:
-    """Filter and transform transactions to only include those with native transfers
+    """Filter and transform transactions to only include those with native transfers.
+    Uses batch contract checking for performance.
 
     Args:
         transactions: List of raw transactions from API
@@ -259,11 +301,29 @@ def filter_and_transform_native_transfers(
     Returns:
         List of tuples: (formatted_transaction, wallet_addresses)
     """
-    native_transfer_transactions = []
+    # First, collect all unique addresses from all transactions
+    unique_addresses = set()
+    for transaction in transactions:
+        asset_transfers = transaction.get("asset_transfers", [])
+        for transfer in asset_transfers:
+            asset = transfer.get("asset", {})
+            if asset.get("type") == "native":
+                from_address = transfer.get("from_address")
+                to_address = transfer.get("to_address")
+                if from_address:
+                    unique_addresses.add(from_address)
+                if to_address:
+                    unique_addresses.add(to_address)
 
+    # Batch check all addresses concurrently
+    print(f"🔍 Checking {len(unique_addresses)} unique addresses for contracts...")
+    contract_results = batch_check_contracts(list(unique_addresses))
+
+    # Now process transactions with pre-computed contract results
+    native_transfer_transactions = []
     for transaction in transactions:
         formatted, wallet_addresses = extract_native_transfers(
-            transaction, api_request_time
+            transaction, api_request_time, contract_results
         )
         if formatted:
             native_transfer_transactions.append((formatted, wallet_addresses))
@@ -298,7 +358,6 @@ def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
     except Exception as e:
         print(f"❌ Error publishing to SNS: {e}")
         raise
-
 
 
 def main():
@@ -346,14 +405,29 @@ def main():
                         )
                     )
 
-                    # Publish each transaction to SNS
+                    # Publish each transaction to SNS in parallel
                     if native_transfer_transactions:
-                        for (
-                            transaction,
-                            wallet_addresses,
-                        ) in native_transfer_transactions:
-                            publish_to_sns(transaction, wallet_addresses)
-                        print(f"✅ Successfully published all transactions to SNS")
+                        with ThreadPoolExecutor(max_workers=20) as executor:
+                            futures = []
+                            for (
+                                transaction,
+                                wallet_addresses,
+                            ) in native_transfer_transactions:
+                                future = executor.submit(
+                                    publish_to_sns, transaction, wallet_addresses
+                                )
+                                futures.append(future)
+
+                            # Wait for all publishes to complete
+                            for future in as_completed(futures):
+                                try:
+                                    future.result()
+                                except Exception as e:
+                                    print(f"❌ Error in parallel SNS publish: {e}")
+
+                        print(
+                            f"✅ Successfully published all {len(native_transfer_transactions)} transactions to SNS"
+                        )
                     else:
                         print("ℹ️ No transactions with native transfers found, skipping")
                 else:
