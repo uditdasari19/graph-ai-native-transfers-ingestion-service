@@ -7,24 +7,408 @@ Main entry point for the ingestion service that ingests native transfers.
 import sys
 import json
 import time
+import os
 from pathlib import Path
+from typing import List, Dict, Optional, Set, Tuple
+from supabase import create_client, Client
+import requests
+from datetime import datetime
+import boto3
+from botocore.exceptions import ClientError
+
+
+# Supabase configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://xfcduaalalfppjfoqwke.supabase.co")
+SUPABASE_KEY = os.getenv(
+    "SUPABASE_ANON_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhmY2R1YWFsYWxmcHBqZm9xd2tlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE4ODg3NjQsImV4cCI6MjA2NzQ2NDc2NH0.f5wyoVkiqO163JRPzjnPn9R3jN-gzqss1PZSJ6PRa2U",
+)
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "TPcB9OYGVkdY9zZqFlmQ9")
+
+# SNS Configuration
+SNS_TOPIC_NAME = os.getenv("SNS_TOPIC_NAME", "BASE_CONTRACT")  # Topic name
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# Allium API configuration
+ALLIUM_API_KEY = os.getenv(
+    "ALLIUM_API_KEY",
+    "kijnI3_lzTVtPgJ32fe9fsysrs1iWakay-HRlm8EBIzxC43NjaIUjhqvPZGlrBkaQiBmGtFkNM1tzZPDNdtXdQ",
+)
+ALLIUM_BASE_URL = "https://api.allium.so/api/v1/developer/wallet/transactions"
+ALLIUM_HEADERS = {"Content-Type": "application/json", "X-API-KEY": ALLIUM_API_KEY}
+
+# Initialize SNS and STS clients
+sns_client = boto3.client("sns", region_name=AWS_REGION)
+sts_client = boto3.client("sts", region_name=AWS_REGION)
+
+
+def get_all_wallets(supabase: Client) -> List[str]:
+    """Fetch all wallet IDs from Supabase"""
+    try:
+        response = supabase.table("wallet").select("wallet_id").execute()
+        wallets = [row["wallet_id"] for row in response.data]
+        print(f"📋 Fetched {len(wallets)} wallets from database")
+        return wallets
+    except Exception as e:
+        print(f"❌ Error fetching wallets: {e}")
+        return []
+
+
+def get_wallet_transactions_page(
+    addresses: List[str], chain: str = "base", cursor: str = None
+) -> Dict:
+    """Fetch one page of wallet transactions from Allium API"""
+
+    # Prepare request body with all addresses
+    payload = [{"chain": chain, "address": addr} for addr in addresses]
+
+    # Prepare query parameters
+    params = {"limit": 1000}
+    if cursor:
+        params["cursor"] = cursor
+
+    try:
+        response = requests.post(
+            ALLIUM_BASE_URL,
+            headers=ALLIUM_HEADERS,
+            params=params,
+            json=payload,
+            timeout=30,
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error making API request: {e}")
+        if hasattr(e, "response") and e.response is not None:
+            print(f"Response status: {e.response.status_code}")
+            print(f"Response content: {e.response.text}")
+        raise
+
+
+def get_all_wallet_transactions(
+    addresses: List[str], chain: str = "base"
+) -> List[Dict]:
+    """Fetch ALL wallet transactions using pagination"""
+    all_transactions = []
+    cursor = None
+    page_count = 0
+
+    while True:
+        page_count += 1
+        print(f"\n📄 Fetching page {page_count}")
+
+        # Get one page of results
+        results = get_wallet_transactions_page(addresses, chain, cursor)
+
+        # Add transactions from this page to our collection
+        if "items" in results and results["items"]:
+            all_transactions.extend(results["items"])
+            print(f"  ✓ Found {len(results['items'])} transactions on this page")
+            print(f"  📊 Total transactions collected: {len(all_transactions)}")
+        else:
+            print(f"  ℹ️ No transactions found on this page")
+            break
+
+        # Check if there's a cursor for the next page
+        if "cursor" in results and results["cursor"]:
+            cursor = results["cursor"]
+            print(f"  ➡️ Cursor found, fetching next page...")
+        else:
+            print(f"  ✓ No more pages available")
+            break
+
+    print(f"\n🎉 Completed! Total transactions fetched: {len(all_transactions)}")
+    return all_transactions
+
+
+def is_contract_address(address: str) -> Tuple[bool, str]:
+    """
+    Check if an address is a contract address using eth_getCode RPC call.
+
+    Args:
+        address: The address to check (with or without 0x prefix)
+
+    Returns:
+        tuple: (is_contract: bool, wallet_address: str or empty string)
+               If it's a contract, wallet_address is empty
+               If it's a wallet, wallet_address contains the address
+    """
+
+    # Ensure address has 0x prefix
+    if not address.startswith("0x"):
+        address = "0x" + address
+
+    rpc_url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getCode",
+        "params": [address, "latest"],  # Check latest block
+        "id": 1,
+    }
+
+    try:
+        r = requests.post(rpc_url, headers=headers, json=payload, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if "error" in data:
+            raise RuntimeError(f"RPC error: {data['error']}")
+
+        result = data.get("result", "")
+
+        # If result is "0x" or empty, it's an EOA (wallet)
+        # If result has bytecode, it's a contract
+        is_contract = result != "0x" and result != ""
+        wallet_address = address if not is_contract else ""
+        return is_contract, wallet_address
+
+    except Exception as e:
+        print(f"Error checking if address {address} is contract: {e}")
+        return False, ""
+
+
+def extract_native_transfers(
+    transaction: Dict, api_request_time: str
+) -> tuple[Optional[Dict], Set[str]]:
+    """Extract native transfers from a transaction and format them
+
+    Args:
+        transaction: Raw transaction dictionary from API
+        api_request_time: ISO format timestamp when API request was made
+
+    Returns:
+        tuple: (formatted_transaction, wallet_addresses_set)
+    """
+    native_transfers = []
+    wallet_addresses = set()  # To track unique wallet addresses
+
+    # Get asset transfers if they exist
+    asset_transfers = transaction.get("asset_transfers", [])
+
+    for transfer in asset_transfers:
+        # Check if this is a native transfer
+        asset = transfer.get("asset", {})
+        if asset.get("type") == "native":
+            from_address = transfer.get("from_address")
+            to_address = transfer.get("to_address")
+
+            # Check if from_address is a contract
+            from_is_contract, from_wallet = is_contract_address(from_address)
+            if not from_is_contract and from_wallet:
+                wallet_addresses.add(from_wallet)
+
+            # Check if to_address is a contract
+            to_is_contract, to_wallet = is_contract_address(to_address)
+            if not to_is_contract and to_wallet:
+                wallet_addresses.add(to_wallet)
+
+            native_transfers.append(
+                {
+                    "from_address": from_address,
+                    "to_address": to_address,
+                    "amount": transfer.get("amount", {}).get("raw_amount"),
+                    "is_from_contract_address": from_is_contract,
+                    "is_to_contract_address": to_is_contract,
+                }
+            )
+
+    # Only return formatted transaction if it has native transfers
+    if native_transfers:
+        formatted = {
+            "api_request_time": api_request_time,
+            "hash": transaction.get("hash"),
+            "event_abi": "BASE_CONTRACT",
+            "native_transfer": native_transfers,
+            "block_timestamp": transaction.get("block_timestamp"),
+            "block_number": transaction.get("block_number"),
+        }
+        return formatted, wallet_addresses
+
+    return None, set()
+
+
+def filter_and_transform_native_transfers(
+    transactions: List[Dict], api_request_time: str
+) -> List[tuple[Dict, Set[str]]]:
+    """Filter and transform transactions to only include those with native transfers
+
+    Args:
+        transactions: List of raw transactions from API
+        api_request_time: ISO format timestamp when API request was made
+
+    Returns:
+        List of tuples: (formatted_transaction, wallet_addresses)
+    """
+    native_transfer_transactions = []
+
+    for transaction in transactions:
+        formatted, wallet_addresses = extract_native_transfers(
+            transaction, api_request_time
+        )
+        if formatted:
+            native_transfer_transactions.append((formatted, wallet_addresses))
+
+    return native_transfer_transactions
+
+
+def get_or_create_sns_topic(topic_name: str) -> str:
+    """Get or create SNS topic ARN"""
+    # Get AWS account ID
+    account_id = sts_client.get_caller_identity().get("Account")
+
+    # Construct topic ARN
+    topic_arn = f"arn:aws:sns:{AWS_REGION}:{account_id}:{topic_name}"
+
+    try:
+        # Try to get topic attributes
+        topic_response = sns_client.get_topic_attributes(TopicArn=topic_arn)
+        topic_arn = topic_response["Attributes"]["TopicArn"]
+        print(f"✓ Found SNS topic '{topic_name}' with ARN: {topic_arn}")
+        return topic_arn
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NotFound":
+            # Topic doesn't exist, create it
+            print(f"SNS topic '{topic_name}' not found. Creating it...")
+            topic = sns_client.create_topic(Name=topic_name)
+            topic_arn = topic["TopicArn"]
+            print(f"Topic '{topic_name}' created with ARN: {topic_arn}")
+            return topic_arn
+        else:
+            raise
+
+
+def publish_to_sns(
+    transaction: Dict, wallet_addresses: Set[str], topic_name: str
+) -> None:
+    """Publish transaction to SNS topic with wallet addresses as message attributes"""
+    try:
+        # Get or create topic ARN
+        topic_arn = get_or_create_sns_topic(topic_name)
+
+        # Prepare message
+        message_body = json.dumps(transaction)
+
+        # Prepare message attributes
+        message_attributes = {}
+
+        # Add wallet addresses as message attribute
+        wallet_addresses_list = list(wallet_addresses)
+        wallet_addresses_json = json.dumps(wallet_addresses_list)
+        message_attributes["wallet_addresses"] = {
+            "DataType": "String.Array",
+            "StringValue": wallet_addresses_json,
+        }
+
+        # Publish to SNS
+        response = sns_client.publish(
+            TopicArn=topic_arn,
+            Message=message_body,
+            MessageAttributes=message_attributes,
+        )
+
+        print(f"✓ Published transaction {transaction.get('hash')} to SNS")
+
+    except Exception as e:
+        print(f"❌ Error publishing to SNS: {e}")
+        raise
+
+
+def save_transactions_to_file(transactions: List[Dict], timestamp: str) -> None:
+    """Save all transactions to file"""
+    try:
+        filename = f"wallet_transactions_{timestamp}.json"
+
+        # Create a structured response with all transactions
+        full_response = {
+            "total_transactions": len(transactions),
+            "fetched_at": datetime.now().isoformat(),
+            "items": transactions,
+        }
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(full_response, f, indent=2, ensure_ascii=False)
+
+        print(f"💾 Transactions saved to: {filename}")
+    except Exception as e:
+        print(f"❌ Error saving results to file: {e}")
+        raise
 
 
 def main():
-    """Main function - Hello World for now."""
+    """Main function - Fetches wallet transactions every minute"""
     print("🚀 Graph AI Wallet Native Transfer Ingestion Service")
-    print("=" * 50)
-    print("Hello World! Service is running...")
+    print("=" * 60)
     print(f"Python version: {sys.version}")
-    print(f"Current time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Keep the service running
+    # Initialize Supabase client
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Supabase client initialized")
+
+    # Main service loop
     try:
+        iteration = 0
         while True:
-            print("💤 Service is alive...")
-            time.sleep(30)
+            iteration += 1
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            timestamp_safe = current_time.replace(" ", "_").replace(":", "-")
+
+            print(f"\n{'='*60}")
+            print(f"⏰ Iteration #{iteration} - {current_time}")
+            print(f"{'='*60}")
+
+            # Get API request time before fetching wallets
+            api_request_time = datetime.now().isoformat()
+
+            # Fetch all wallets from Supabase
+            wallets = get_all_wallets(supabase)
+
+            if not wallets:
+                print("⚠️ No wallets found in database. Skipping...")
+            else:
+                print(f"🔍 Processing {len(wallets)} wallet(s)")
+
+                # Fetch all transactions for these wallets
+                all_transactions = get_all_wallet_transactions(wallets)
+
+                # Filter and transform to only include native transfers
+                if all_transactions:
+                    print(f"🔄 Filtering transactions with native transfers...")
+                    native_transfer_transactions = (
+                        filter_and_transform_native_transfers(
+                            all_transactions, api_request_time
+                        )
+                    )
+                    print(
+                        f"✓ Found {len(native_transfer_transactions)} transactions with native transfers"
+                    )
+
+                    # Publish each transaction to SNS
+                    if native_transfer_transactions:
+                        print(
+                            f"📤 Publishing {len(native_transfer_transactions)} transactions to SNS..."
+                        )
+                        for (
+                            transaction,
+                            wallet_addresses,
+                        ) in native_transfer_transactions:
+                            publish_to_sns(
+                                transaction, wallet_addresses, SNS_TOPIC_NAME
+                            )
+                        print(f"✅ Successfully published all transactions to SNS")
+                    else:
+                        print("ℹ️ No transactions with native transfers found, skipping")
+                else:
+                    print("ℹ️ No transactions found")
+
+            print(f"\n💤 Sleeping for 1 minute...")
+            time.sleep(60)  # Wait 1 minute before next iteration
+
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down...")
+        print("\n\n🛑 Shutting down...")
         print("✅ Service shutdown complete")
 
 
