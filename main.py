@@ -14,7 +14,6 @@ from supabase import create_client, Client
 import requests
 from datetime import datetime
 import boto3
-from botocore.exceptions import ClientError
 
 
 # Supabase configuration
@@ -23,11 +22,12 @@ SUPABASE_KEY = os.getenv(
     "SUPABASE_ANON_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhmY2R1YWFsYWxmcHBqZm9xd2tlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE4ODg3NjQsImV4cCI6MjA2NzQ2NDc2NH0.f5wyoVkiqO163JRPzjnPn9R3jN-gzqss1PZSJ6PRa2U",
 )
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "TPcB9OYGVkdY9zZqFlmQ9")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "H3DAAKW7uGI2-8nEl6c0H")
 
 # SNS Configuration
-SNS_TOPIC_NAME = os.getenv("SNS_TOPIC_NAME", "BASE_CONTRACT")  # Topic name
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+SNS_TOPIC_ARN = os.getenv(
+    "SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:631447262747:BASE_CONTRACT"
+)
 
 # Allium API configuration
 ALLIUM_API_KEY = os.getenv(
@@ -37,17 +37,25 @@ ALLIUM_API_KEY = os.getenv(
 ALLIUM_BASE_URL = "https://api.allium.so/api/v1/developer/wallet/transactions"
 ALLIUM_HEADERS = {"Content-Type": "application/json", "X-API-KEY": ALLIUM_API_KEY}
 
-# Initialize SNS and STS clients
-sns_client = boto3.client("sns", region_name=AWS_REGION)
-sts_client = boto3.client("sts", region_name=AWS_REGION)
+# Initialize SNS client
+sns_client = boto3.client("sns", region_name="us-east-1")
+
+# Cache for wallet addresses (set of known wallet addresses)
+_wallet_cache: Set[str] = set()
 
 
 def get_all_wallets(supabase: Client) -> List[str]:
-    """Fetch all wallet IDs from Supabase"""
+    """Fetch all wallet IDs from Supabase and update wallet cache"""
     try:
         response = supabase.table("wallet").select("wallet_id").execute()
         wallets = [row["wallet_id"] for row in response.data]
+
+        # Add all wallets to cache (addresses are already normalized with 0x)
+        for wallet in wallets:
+            _wallet_cache.add(wallet.lower())
+
         print(f"📋 Fetched {len(wallets)} wallets from database")
+        print(f"💾 Updated wallet cache with {len(wallets)} wallet addresses")
         return wallets
     except Exception as e:
         print(f"❌ Error fetching wallets: {e}")
@@ -125,21 +133,26 @@ def get_all_wallet_transactions(
 
 def is_contract_address(address: str) -> Tuple[bool, str]:
     """
-    Check if an address is a contract address using eth_getCode RPC call.
+    Check if an address is a contract address using cache first, then Alchemy API.
 
     Args:
-        address: The address to check (with or without 0x prefix)
+        address: The address to check (already has 0x prefix)
 
     Returns:
         tuple: (is_contract: bool, wallet_address: str or empty string)
                If it's a contract, wallet_address is empty
                If it's a wallet, wallet_address contains the address
     """
+    # Addresses are already normalized (0x prefix), just make lowercase
+    normalized_addr = address.lower()
 
-    # Ensure address has 0x prefix
-    if not address.startswith("0x"):
-        address = "0x" + address
+    # Check cache first
+    if normalized_addr in _wallet_cache:
+        # It's a wallet
+        wallet_address = address
+        return False, wallet_address
 
+    # Not in cache, make API call
     rpc_url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
     headers = {"Content-Type": "application/json"}
@@ -163,12 +176,21 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
         # If result is "0x" or empty, it's an EOA (wallet)
         # If result has bytecode, it's a contract
         is_contract = result != "0x" and result != ""
+
+        # If it's a wallet, add to cache
+        if not is_contract:
+            _wallet_cache.add(normalized_addr)
+
         wallet_address = address if not is_contract else ""
         return is_contract, wallet_address
 
     except Exception as e:
-        print(f"Error checking if address {address} is contract: {e}")
-        return False, ""
+        print(
+            f"⚠️ Error checking if address {address} is contract (assuming contract): {e}"
+        )
+        # Fallback: assume it's a contract if we can't determine
+        # Don't add to cache, return as contract
+        return True, ""
 
 
 def extract_native_transfers(
@@ -255,40 +277,9 @@ def filter_and_transform_native_transfers(
     return native_transfer_transactions
 
 
-def get_or_create_sns_topic(topic_name: str) -> str:
-    """Get or create SNS topic ARN"""
-    # Get AWS account ID
-    account_id = sts_client.get_caller_identity().get("Account")
-
-    # Construct topic ARN
-    topic_arn = f"arn:aws:sns:{AWS_REGION}:{account_id}:{topic_name}"
-
-    try:
-        # Try to get topic attributes
-        topic_response = sns_client.get_topic_attributes(TopicArn=topic_arn)
-        topic_arn = topic_response["Attributes"]["TopicArn"]
-        print(f"✓ Found SNS topic '{topic_name}' with ARN: {topic_arn}")
-        return topic_arn
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "NotFound":
-            # Topic doesn't exist, create it
-            print(f"SNS topic '{topic_name}' not found. Creating it...")
-            topic = sns_client.create_topic(Name=topic_name)
-            topic_arn = topic["TopicArn"]
-            print(f"Topic '{topic_name}' created with ARN: {topic_arn}")
-            return topic_arn
-        else:
-            raise
-
-
-def publish_to_sns(
-    transaction: Dict, wallet_addresses: Set[str], topic_name: str
-) -> None:
+def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
     """Publish transaction to SNS topic with wallet addresses as message attributes"""
     try:
-        # Get or create topic ARN
-        topic_arn = get_or_create_sns_topic(topic_name)
-
         # Prepare message
         message_body = json.dumps(transaction)
 
@@ -303,9 +294,9 @@ def publish_to_sns(
             "StringValue": wallet_addresses_json,
         }
 
-        # Publish to SNS
+        # Publish to SNS using the hardcoded ARN
         response = sns_client.publish(
-            TopicArn=topic_arn,
+            TopicArn=SNS_TOPIC_ARN,
             Message=message_body,
             MessageAttributes=message_attributes,
         )
@@ -395,9 +386,7 @@ def main():
                             transaction,
                             wallet_addresses,
                         ) in native_transfer_transactions:
-                            publish_to_sns(
-                                transaction, wallet_addresses, SNS_TOPIC_NAME
-                            )
+                            publish_to_sns(transaction, wallet_addresses)
                         print(f"✅ Successfully published all transactions to SNS")
                     else:
                         print("ℹ️ No transactions with native transfers found, skipping")
