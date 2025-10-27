@@ -54,8 +54,6 @@ def get_all_wallets(supabase: Client) -> List[str]:
         for wallet in wallets:
             _wallet_cache.add(wallet.lower())
 
-        print(f"📋 Fetched {len(wallets)} wallets from database")
-        print(f"💾 Updated wallet cache with {len(wallets)} wallet addresses")
         return wallets
     except Exception as e:
         print(f"❌ Error fetching wallets: {e}")
@@ -105,7 +103,6 @@ def get_all_wallet_transactions(
 
     while True:
         page_count += 1
-        print(f"\n📄 Fetching page {page_count}")
 
         # Get one page of results
         results = get_wallet_transactions_page(addresses, chain, cursor)
@@ -113,8 +110,6 @@ def get_all_wallet_transactions(
         # Add transactions from this page to our collection
         if "items" in results and results["items"]:
             all_transactions.extend(results["items"])
-            print(f"  ✓ Found {len(results['items'])} transactions on this page")
-            print(f"  📊 Total transactions collected: {len(all_transactions)}")
         else:
             print(f"  ℹ️ No transactions found on this page")
             break
@@ -122,7 +117,6 @@ def get_all_wallet_transactions(
         # Check if there's a cursor for the next page
         if "cursor" in results and results["cursor"]:
             cursor = results["cursor"]
-            print(f"  ➡️ Cursor found, fetching next page...")
         else:
             print(f"  ✓ No more pages available")
             break
@@ -268,6 +262,7 @@ def filter_and_transform_native_transfers(
     native_transfer_transactions = []
 
     for transaction in transactions:
+        print(f"Processing transaction {transaction.get('hash')}")
         formatted, wallet_addresses = extract_native_transfers(
             transaction, api_request_time
         )
@@ -308,26 +303,6 @@ def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
         raise
 
 
-def save_transactions_to_file(transactions: List[Dict], timestamp: str) -> None:
-    """Save all transactions to file"""
-    try:
-        filename = f"wallet_transactions_{timestamp}.json"
-
-        # Create a structured response with all transactions
-        full_response = {
-            "total_transactions": len(transactions),
-            "fetched_at": datetime.now().isoformat(),
-            "items": transactions,
-        }
-
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(full_response, f, indent=2, ensure_ascii=False)
-
-        print(f"💾 Transactions saved to: {filename}")
-    except Exception as e:
-        print(f"❌ Error saving results to file: {e}")
-        raise
-
 
 def main():
     """Main function - Fetches wallet transactions every minute"""
@@ -367,21 +342,14 @@ def main():
 
                 # Filter and transform to only include native transfers
                 if all_transactions:
-                    print(f"🔄 Filtering transactions with native transfers...")
                     native_transfer_transactions = (
                         filter_and_transform_native_transfers(
                             all_transactions, api_request_time
                         )
                     )
-                    print(
-                        f"✓ Found {len(native_transfer_transactions)} transactions with native transfers"
-                    )
 
                     # Publish each transaction to SNS
                     if native_transfer_transactions:
-                        print(
-                            f"📤 Publishing {len(native_transfer_transactions)} transactions to SNS..."
-                        )
                         for (
                             transaction,
                             wallet_addresses,
