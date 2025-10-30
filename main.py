@@ -48,6 +48,9 @@ _wallet_cache: Set[str] = set()
 _contract_cache: Set[str] = set()
 _cache_lock = threading.Lock()  # Thread-safe access to caches
 
+# Cache of all encountered addresses (for estimating API calls)
+_addresses_seen: Set[str] = set()
+
 # Alchemy API call counter
 _alchemy_call_count = 0
 _alchemy_counter_lock = threading.Lock()  # Thread-safe access to counter
@@ -151,6 +154,11 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
     # Addresses are already normalized (0x prefix), just make lowercase
     normalized_addr = address.lower()
 
+    # Track every encountered address and print the total unique count
+    with _cache_lock:
+        _addresses_seen.add(normalized_addr)
+        print(f"📦 Addresses encountered (unique): {len(_addresses_seen)}")
+
     # Check caches first (thread-safe read)
     with _cache_lock:
         in_wallet_cache = normalized_addr in _wallet_cache
@@ -172,6 +180,7 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
         _alchemy_call_count += 1
         call_number = _alchemy_call_count
 
+    return True, ""
     print(f"📞 Alchemy API calls so far: {call_number}")
 
     rpc_url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
@@ -336,8 +345,13 @@ def filter_and_transform_native_transfers(
                 if to_address:
                     unique_addresses.add(to_address)
 
+    # Track addresses encountered (new or duplicate) and print size
+    with _cache_lock:
+        for addr in unique_addresses:
+            _addresses_seen.add(addr.lower())
+        print(f"📦 Addresses encountered (unique): {len(_addresses_seen)}")
+
     # Batch check all addresses concurrently
-    print(f"🔍 Checking {len(unique_addresses)} unique addresses for contracts...")
     contract_results = batch_check_contracts(list(unique_addresses))
 
     # Now process transactions with pre-computed contract results
