@@ -44,7 +44,13 @@ sns_client = boto3.client("sns", region_name="us-east-1")
 
 # Cache for wallet addresses (set of known wallet addresses)
 _wallet_cache: Set[str] = set()
-_cache_lock = threading.Lock()  # Thread-safe access to cache
+# Cache for contract addresses (set of known contract addresses)
+_contract_cache: Set[str] = set()
+_cache_lock = threading.Lock()  # Thread-safe access to caches
+
+# Alchemy API call counter
+_alchemy_call_count = 0
+_alchemy_counter_lock = threading.Lock()  # Thread-safe access to counter
 
 
 def get_all_wallets(supabase: Client) -> List[str]:
@@ -145,16 +151,29 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
     # Addresses are already normalized (0x prefix), just make lowercase
     normalized_addr = address.lower()
 
-    # Check cache first (thread-safe read)
+    # Check caches first (thread-safe read)
     with _cache_lock:
-        in_cache = normalized_addr in _wallet_cache
+        in_wallet_cache = normalized_addr in _wallet_cache
+        in_contract_cache = normalized_addr in _contract_cache
 
-    if in_cache:
+    if in_wallet_cache:
         # It's a wallet
         wallet_address = address
         return False, wallet_address
 
-    # Not in cache, make API call
+    if in_contract_cache:
+        # It's a contract
+        return True, ""
+
+    # Not in either cache, make API call
+    # Increment counter (thread-safe)
+    with _alchemy_counter_lock:
+        global _alchemy_call_count
+        _alchemy_call_count += 1
+        call_number = _alchemy_call_count
+
+    print(f"📞 Alchemy API calls so far: {call_number}")
+
     rpc_url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
     headers = {"Content-Type": "application/json"}
@@ -179,9 +198,11 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
         # If result has bytecode, it's a contract
         is_contract = result != "0x" and result != ""
 
-        # If it's a wallet, add to cache (thread-safe write)
-        if not is_contract:
-            with _cache_lock:
+        # Add to appropriate cache (thread-safe write)
+        with _cache_lock:
+            if is_contract:
+                _contract_cache.add(normalized_addr)
+            else:
                 _wallet_cache.add(normalized_addr)
 
         wallet_address = address if not is_contract else ""
